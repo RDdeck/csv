@@ -1,0 +1,3 @@
+cx_Oracle
+mysql-connector-python
+pandas
