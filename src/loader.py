@@ -1,8 +1,13 @@
 import pandas as pd
+import logging
 from mysql.connector import Error as MySQLError
 from .db_connector import connect_mysql # Relative import
-from .config_loader import load_config # Relative import
-from .transformer import get_column_mappings, transform_data # Relative imports
+# Below imports only used in __main__ example block
+from .config_loader import load_config
+from .transformer import get_column_mappings, transform_data
+
+# Assuming logging is configured elsewhere (e.g., main_pipeline.py)
+log = logging.getLogger(__name__)
 
 def get_target_table(config, source_table_name):
     """Gets the target MySQL table name for a given source Oracle table name."""
@@ -20,63 +25,194 @@ def load_data_to_mysql(mysql_conn, df, target_table_name):
         target_table_name (str): The name of the target MySQL table.
 
     Returns:
-        tuple: (success_count, failure_count) indicating how many rows
-               were successfully inserted and how many failed.
+        tuple: (affected_rows_count, failure_count) indicating rows affected by
+               upsert (inserts + updates) and rows assumed failed in the batch.
     """
     if not isinstance(df, pd.DataFrame) or df.empty:
-        print(f"DataFrame for {target_table_name} is empty or invalid. Skipping load.")
+        log.warning(f"DataFrame for {target_table_name} is empty or invalid. Skipping load.")
+        return 0, 0
+    if not list(df.columns):
+        log.warning(f"DataFrame for {target_table_name} has no columns. Skipping load.")
         return 0, 0
 
     cursor = None
-    success_count = 0
+    affected_rows_count = 0 # Renamed from success_count
     failure_count = 0
+    sql = "" # Initialize sql string
 
     try:
         cursor = mysql_conn.cursor()
 
-        # Prepare the INSERT statement
-        cols = ', '.join([f"`{col}`" for col in df.columns]) # Use backticks for safety
+        # --- Construct UPSERT statement ---
+        # Assume the first column is the primary key (as per requirement)
+        pk_col = df.columns[0]
+        quoted_cols = [f"`{col}`" for col in df.columns]
+        cols_sql = ', '.join(quoted_cols)
         placeholders = ', '.join(['%s'] * len(df.columns))
-        sql = f"INSERT INTO `{target_table_name}` ({cols}) VALUES ({placeholders})"
-        print(f"Preparing to load {len(df)} rows into MySQL table: {target_table_name}")
-        # print(f"Sample INSERT statement structure: {sql}") # Uncomment for debugging
 
-        # Convert DataFrame to list of tuples for executemany
-        # Handle potential NaN/NaT values which MySQL might not like directly
+        # Build INSERT part
+        sql = f"INSERT INTO `{target_table_name}` ({cols_sql}) VALUES ({placeholders})"
+
+        # Build ON DUPLICATE KEY UPDATE part
+        update_clauses = []
+        # Iterate columns *excluding* the first (assumed PK)
+        if len(quoted_cols) > 1:
+             for col in quoted_cols[1:]:
+                 update_clauses.append(f"{col} = VALUES({col})")
+
+             if update_clauses: # Only add clause if there are non-PK columns
+                 update_sql = ', '.join(update_clauses)
+                 sql += f" ON DUPLICATE KEY UPDATE {update_sql}"
+             else:
+                 # This case (only PK column) is unlikely but noted.
+                 # The INSERT will behave like INSERT IGNORE if PK exists.
+                 log.warning(f"Table {target_table_name} seems to only have a PK column ('{pk_col}'). ON DUPLICATE KEY UPDATE clause skipped.")
+        else:
+             # Also unlikely, but handle case of only one column total
+             log.warning(f"DataFrame for {target_table_name} only has one column ('{pk_col}'). ON DUPLICATE KEY UPDATE clause skipped.")
+
+
+        log.info(f"Preparing to upsert {len(df)} rows into MySQL table: {target_table_name}")
+        log.debug(f"Upsert statement structure: {sql}") # Use debug level for potentially long SQL
+
+        # Convert DataFrame to list of tuples (handle NaN/NaT)
         data_tuples = [
             tuple(None if pd.isna(x) else x for x in row)
             for row in df.itertuples(index=False, name=None)
         ]
 
-        # Use executemany for bulk insertion
-        # Note: executemany might not provide row-level error feedback easily across all connectors/versions.
-        # For granular error handling, row-by-row insert in a loop with try-except is needed, but much slower.
+        # Execute using executemany
         cursor.executemany(sql, data_tuples)
         mysql_conn.commit() # Commit the transaction
 
-        success_count = cursor.rowcount if cursor.rowcount >= 0 else len(data_tuples) # rowcount can be -1 sometimes
-        print(f"Successfully loaded {success_count} rows into {target_table_name}.")
+        # --- Handle row count for UPSERT ---
+        # cursor.rowcount for INSERT...ON DUPLICATE KEY UPDATE:
+        # - Returns 1 for each new row inserted.
+        # - Returns 2 for each row updated (if the data actually changed).
+        # - Returns 0 if an existing row was not updated (values were the same).
+        # We capture the total affected rows (inserts + updates).
+        affected_rows_count = cursor.rowcount if cursor.rowcount >= 0 else len(data_tuples) # Fallback if rowcount is -1
+        log.info(f"Successfully upserted data into {target_table_name}. Rows affected (inserted/updated): {affected_rows_count}.")
+        if cursor.rowcount >= 0:
+            log.debug(f"Raw cursor.rowcount from executemany (1=inserted, 2=updated): {cursor.rowcount}")
+        else:
+            log.warning("cursor.rowcount was negative, using DataFrame length as fallback for affected rows count.")
+
 
     except MySQLError as e:
-        print(f"MySQL Error loading data into {target_table_name}: {e}")
-        print("Attempted SQL:", sql[:500] + "..." if len(sql) > 500 else sql) # Print truncated SQL
-        # Consider logging sample failing data (first few tuples) here for debugging
-        # print("Sample data tuples (first 5):", data_tuples[:5])
+        log.error(f"MySQL Error during upsert into {target_table_name}: {e}", exc_info=True)
+        log.error(f"Failed SQL structure: {sql[:1000]}{'...' if len(sql) > 1000 else ''}") # Log truncated SQL
+        # Log sample failing data (first few tuples) here for debugging if needed
+        # log.error(f"Sample data tuples (first 3): {data_tuples[:3]}")
         failure_count = len(df) # Assume all rows in this batch failed on error
-        success_count = 0
+        affected_rows_count = 0
         try:
+            log.warning("Attempting to rollback transaction...")
             mysql_conn.rollback() # Rollback on error
-            print("Transaction rolled back.")
+            log.info("Transaction rolled back.")
         except MySQLError as rb_err:
-            print(f"Error during rollback: {rb_err}")
+            log.error(f"Error during rollback: {rb_err}")
     except Exception as e:
-        print(f"Unexpected error loading data into {target_table_name}: {e}")
+        log.error(f"Unexpected error loading data into {target_table_name}: {e}", exc_info=True)
         failure_count = len(df)
-        success_count = 0
-        # Attempt rollback here too? Depends on error type.
+        affected_rows_count = 0
+        # Consider rollback here too, though may not be needed if connection died
+        if mysql_conn and mysql_conn.is_connected():
+             try:
+                 log.warning("Attempting to rollback transaction due to unexpected error...")
+                 mysql_conn.rollback()
+                 log.info("Transaction rolled back.")
+             except MySQLError as rb_err:
+                 log.error(f"Error during rollback after unexpected error: {rb_err}")
     finally:
         if cursor:
             cursor.close()
+
+    return affected_rows_count, failure_count
+
+
+if __name__ == '__main__':
+    # Example Usage: Load config, connect, create dummy data, transform, load
+    # Configure basic logging for the example
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    log = logging.getLogger(__name__) # Re-get logger after basicConfig
+
+    try:
+        config = load_config()
+        source_table_example = 'oracle_employees' # Must match a key in [migration]
+        target_table_example = get_target_table(config, source_table_example)
+
+        if not target_table_example:
+            log.error(f"Error: No target table mapping found for '{source_table_example}' in config.")
+        else:
+            log.info(f"\n--- Loading Example for {source_table_example} -> {target_table_example} ---")
+
+            # --- Create Dummy Data (same as transformer example) ---
+            dummy_data = {
+                'EMP_ID': [101, 102, 103], # Assumed PK
+                'FIRST_NAME': ['Alice', 'Bob', 'Charlie'],
+                'HIRE_DATE': ['2024-01-10', '2024-02-20', None], # Include None/NaN
+                'SALARY': [70000, 80000, 75000]
+            }
+            source_df = pd.DataFrame(dummy_data)
+            source_df['HIRE_DATE'] = pd.to_datetime(source_df['HIRE_DATE'], errors='coerce') # Convert to datetime/NaT
+
+            # --- Transform Data ---
+            col_mappings = get_column_mappings(config, source_table_example)
+            transformed_df = transform_data(source_df.copy(), col_mappings)
+            log.info("\nTransformed DataFrame to Load:")
+            log.info(transformed_df)
+
+            # --- Connect to MySQL ---
+            mysql_conn = connect_mysql(config)
+
+            if mysql_conn:
+                log.info(f"\nAttempting to upsert data into MySQL table: {target_table_example}")
+                # Assumes target table (e.g., mysql_staff) exists with appropriate columns and PK
+                # Example: CREATE TABLE mysql_staff (
+                #     staff_id INT PRIMARY KEY,  -- Matches first col 'EMP_ID' -> 'staff_id'
+                #     first_name VARCHAR(50),   -- Matches 'FIRST_NAME' -> 'first_name'
+                #     start_date DATE,         -- Matches 'HIRE_DATE' -> 'start_date'
+                #     salary DECIMAL(10, 2)     -- Matches 'SALARY' -> 'salary'
+                # );
+
+                # --- First Load (Insert) ---
+                log.info("\n--- First Load Attempt (should insert) ---")
+                success1, failures1 = load_data_to_mysql(mysql_conn, transformed_df.copy(), target_table_example)
+                log.info(f"Load 1 complete. Affected Rows: {success1}, Failures: {failures1}")
+
+                # --- Modify data for second load (Update) ---
+                log.info("\n--- Second Load Attempt (should update/insert) ---")
+                # Change Alice's salary, add a new employee
+                modified_data = {
+                    'EMP_ID': [101, 104], # Update 101, Insert 104
+                    'FIRST_NAME': ['Alice', 'David'],
+                    'HIRE_DATE': ['2024-01-10', '2024-03-15'],
+                    'SALARY': [72000, 90000] # Updated salary for Alice
+                }
+                modified_df_source = pd.DataFrame(modified_data)
+                modified_df_source['HIRE_DATE'] = pd.to_datetime(modified_df_source['HIRE_DATE'], errors='coerce')
+                modified_transformed_df = transform_data(modified_df_source.copy(), col_mappings)
+                log.info("Modified Transformed DataFrame to Load:")
+                log.info(modified_transformed_df)
+
+                success2, failures2 = load_data_to_mysql(mysql_conn, modified_transformed_df, target_table_example)
+                # Expected rowcount: 2 (for update of 101) + 1 (for insert of 104) = 3 (if data changed)
+                log.info(f"Load 2 complete. Affected Rows: {success2}, Failures: {failures2}")
+                log.info("Check the mysql_staff table to verify results.")
+
+                # Close connection
+                mysql_conn.close()
+                log.info("MySQL connection closed.")
+            else:
+                log.error("Cannot proceed with loading, MySQL connection failed.")
+
+    except FileNotFoundError as e:
+        log.error(f"Configuration file error: {e}")
+    except MySQLError as e:
+         log.error(f"Database error during loading test: {e}", exc_info=True)
+    except Exception as e:
+        log.error(f"An error occurred during loading testing: {e}", exc_info=True)
 
     return success_count, failure_count
 
